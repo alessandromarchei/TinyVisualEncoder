@@ -17,7 +17,7 @@ from models.tiny_visual_frontend import (
     count_parameters,
 )
 from models.visual_frontend import VisualFrontend
-
+import wandb
 
 # ============================================================
 # Arguments
@@ -243,7 +243,13 @@ def parse_args():
     p.add_argument(
         "--lr",
         type=float,
-        default=3e-4,
+        default=1e-4,
+    )
+
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=5e-6,
     )
 
     p.add_argument(
@@ -297,6 +303,31 @@ def parse_args():
         type=int,
         default=42,
     )
+
+
+    p.add_argument(
+        "--wandb-project",
+        type=str,
+        default="lip-embedding-frontend",
+    )
+
+    p.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+    )
+
+    p.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+    )
+
+    p.add_argument(
+        "--no-wandb",
+        action="store_true",
+    )
+
 
     return p.parse_args()
 
@@ -397,13 +428,13 @@ def make_loader(
     kwargs = {
         "batch_size": args.batch_size,
         "shuffle": train,
-        "num_workers": args.workers,
+        "num_workers": args.workers if train else 8,
         "pin_memory": torch.cuda.is_available(),
         "drop_last": train,
-        "persistent_workers": args.workers > 0,
+        "persistent_workers": train,
     }
 
-    if args.workers > 0:
+    if args.workers > 0 and train:
         kwargs["prefetch_factor"] = 2
 
     return DataLoader(
@@ -809,6 +840,7 @@ def main():
             indent=2,
         )
 
+
     # ========================================================
     # Build dataset
     # ========================================================
@@ -999,6 +1031,7 @@ def main():
         torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=args.epochs,
+            eta_min=args.min_lr
         )
     )
 
@@ -1091,6 +1124,59 @@ def main():
     else:
 
         history = []
+
+
+
+    # ========================================================
+    # LOGGER
+    # ========================================================
+
+    wandb_run = None
+
+    if not args.no_wandb:
+        
+        if args.wandb_name is None:
+            args.wandb_name = Path(args.output).name
+
+            
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config={
+                **vars(args),
+
+                # Dataset
+                "num_train_samples": len(train_samples),
+                "num_val_samples": len(val_samples),
+
+                # Model
+                "student_parameters": count_parameters(student),
+
+                # Runtime
+                "device": str(device),
+            },
+            dir=str(output_dir),
+        )
+
+        wandb.define_metric(
+            "epoch"
+        )
+
+        wandb.define_metric(
+            "train/*",
+            step_metric="epoch",
+        )
+
+        wandb.define_metric(
+            "val/*",
+            step_metric="epoch",
+        )
+
+        wandb.define_metric(
+            "lr",
+            step_metric="epoch",
+        )
 
     # ========================================================
     # Training
@@ -1198,6 +1284,34 @@ def main():
             f"{current_lr:.8g}"
         )
 
+
+        if wandb_run is not None:
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+
+                    # Training
+                    "train/loss": train_metrics["loss"],
+                    "train/huber": train_metrics["huber"],
+                    "train/mse": train_metrics["mse"],
+                    "train/cosine_similarity":
+                        train_metrics["cosine_similarity"],
+
+                    # Validation
+                    "val/loss": val_metrics["loss"],
+                    "val/huber": val_metrics["huber"],
+                    "val/mse": val_metrics["mse"],
+                    "val/cosine_similarity":
+                        val_metrics["cosine_similarity"],
+
+                    # Optimizer
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+                step=epoch,
+            )
+
+            
         # ----------------------------------------------------
         # Last checkpoint
         # ----------------------------------------------------
@@ -1262,6 +1376,9 @@ def main():
         f"{checkpoint_dir / 'best.pt'}"
     )
     print("=" * 72)
+
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
