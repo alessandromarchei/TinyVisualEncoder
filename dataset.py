@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import blosc2
+
 def temporal_indices(num_frames, source_fps, target_fps):
     if num_frames <= 0:
         return np.empty((0,), dtype=np.int64)
@@ -637,114 +639,67 @@ class VisualKDDataset(Dataset):
         self,
         sample,
     ):
-
         if self.frame_cache_dir is None:
             return None
 
-        # sample["key"]:
-        #
-        # id00012/video_id/utterance
-
         return (
             self.frame_cache_dir
-            / f"{sample['key']}.npy"
+            / f"{sample['key']}.b2nd"
         )
 
     def _load_frames(
         self,
         sample,
     ):
-
-        video_path = sample["video"]
-
-        cache_path = self._frame_cache_path(
-            sample
-        )
-
-        # ----------------------------------------------------
-        # Cache hit
-        # ----------------------------------------------------
+        cache_path = self._frame_cache_path(sample)
 
         if (
             cache_path is not None
             and cache_path.is_file()
         ):
-
             try:
 
-                frames = np.load(
-                    cache_path,
-                    mmap_mode="r",
-                    allow_pickle=False,
+                frames = blosc2.open(
+                    str(cache_path),
+                    mode="r",
                 )
 
                 if frames.ndim != 3:
                     raise ValueError(
-                        f"Expected [T,H,W], got "
-                        f"{frames.shape}"
+                        f"Expected [T,H,W], got {frames.shape}"
                     )
 
-                if (
-                    frames.shape[1] != 112
-                    or frames.shape[2] != 112
-                ):
+                if frames.shape[1:] != (112, 112):
                     raise ValueError(
-                        f"Expected [T,112,112], got "
-                        f"{frames.shape}"
+                        f"Expected [T,112,112], got {frames.shape}"
                     )
 
                 return frames
 
             except Exception as exc:
-
                 raise RuntimeError(
-                    f"Invalid frame cache: "
-                    f"{cache_path}"
+                    f"Invalid frame cache: {cache_path}"
                 ) from exc
 
-        # ----------------------------------------------------
-        # Cache miss -> MP4
-        # ----------------------------------------------------
-
+        # Fallback to MP4
         frames = read_video(
-            video_path,
+            sample["video"],
             source_fps=self.source_fps,
             target_fps=self.target_fps,
             spatial=self.spatial,
             gray=self.gray,
         )
 
-        # We intentionally cache uint8:
-        #
-        #   grayscale
-        #   spatially preprocessed
-        #   temporally sampled
-        #
-        # but NOT normalized.
-
         if frames.dtype != np.uint8:
-
             frames = np.clip(
                 frames,
                 0,
                 255,
-            ).astype(
-                np.uint8
-            )
-
-        # ----------------------------------------------------
-        # Create persistent cache
-        # ----------------------------------------------------
-
-        if cache_path is not None:
-
-            atomic_save_npy(
-                cache_path,
-                frames,
-            )
+            ).astype(np.uint8)
 
         return frames
 
+        
     # ========================================================
     # Teacher target
     # ========================================================
