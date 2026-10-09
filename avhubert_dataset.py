@@ -97,14 +97,14 @@ def _resolve_lmdb_path(path):
     return path
 
 
-def _open_lmdb(path):
+def _open_lmdb(path, readahead=False):
     path = _resolve_lmdb_path(path)
     return lmdb.open(
         str(path),
         subdir=path.is_dir(),
         readonly=True,
         lock=False,
-        readahead=False,
+        readahead=readahead,
         meminit=False,
         max_readers=256,
     )
@@ -135,59 +135,47 @@ def _candidate_teacher_keys(row, dataset_roots):
 def _teacher_key_index(path, manifest_rows, dataset_roots):
     path = _resolve_lmdb_path(path)
     print(f"Opening teacher LMDB: {path}", flush=True)
-    env = _open_lmdb(path)
+    env = _open_lmdb(path, readahead=True)
     index = {}
     sample_teacher_keys = []
+    exact_key_to_input = {}
+    normalized_key_to_input = {}
+    for row in manifest_rows:
+        input_key = canonical_key(row["key"])
+        normalized_key_to_input[input_key] = input_key
+        for candidate in _candidate_teacher_keys(row, dataset_roots):
+            exact_key_to_input.setdefault(candidate, input_key)
+
+    total_keys = env.stat()["entries"]
     print(
-        f"Looking up teacher targets for {len(manifest_rows):,} input rows...",
+        f"Sequentially matching {len(manifest_rows):,} inputs against "
+        f"{total_keys:,} teacher keys...",
         flush=True,
     )
     try:
         with env.begin(write=False) as txn:
-            for row in tqdm(
-                manifest_rows,
-                desc="Matching AV-HuBERT targets",
-                unit="rows",
+            cursor = txn.cursor()
+            for raw_key in tqdm(
+                cursor.iternext(keys=True, values=False),
+                total=total_keys,
+                desc="Scanning teacher LMDB",
+                unit="keys",
                 dynamic_ncols=True,
             ):
-                normalized = canonical_key(row["key"])
-                for key in _candidate_teacher_keys(row, dataset_roots):
-                    if txn.get(key.encode("utf-8")) is not None:
-                        index[normalized] = key
-                        break
+                try:
+                    key = raw_key.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if len(sample_teacher_keys) < 8:
+                    sample_teacher_keys.append(key)
 
-            missing = {
-                canonical_key(row["key"])
-                for row in manifest_rows
-                if canonical_key(row["key"]) not in index
-            }
-            if missing:
-                print(
-                    f"Direct key lookups matched {len(index):,}; scanning "
-                    "LMDB keys for path-independent matches...",
-                    flush=True,
-                )
-                total_keys = env.stat()["entries"]
-                cursor = txn.cursor()
-                for raw_key in tqdm(
-                    cursor.iternext(keys=True, values=False),
-                    total=total_keys,
-                    desc="Normalizing teacher keys",
-                    unit="keys",
-                    dynamic_ncols=True,
-                ):
-                    try:
-                        key = raw_key.decode("utf-8")
-                    except UnicodeDecodeError:
-                        continue
-                    if len(sample_teacher_keys) < 8:
-                        sample_teacher_keys.append(key)
-                    normalized = canonical_key(key)
-                    if normalized in missing:
-                        index[normalized] = key
-                        missing.remove(normalized)
-                        if not missing:
-                            break
+                input_key = exact_key_to_input.get(key)
+                if input_key is None:
+                    input_key = normalized_key_to_input.get(canonical_key(key))
+                if input_key is not None:
+                    index[input_key] = key
+                    if len(index) == len(normalized_key_to_input):
+                        break
     finally:
         env.close()
     print(f"Matched {len(index):,} teacher keys to input manifest.", flush=True)
