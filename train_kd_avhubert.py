@@ -17,30 +17,25 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
-from avhubert_dataset import AVHubertLMDBDataset, build_avhubert_samples
 from losses import kd_loss
 from models.tiny_visual_frontend import TinyVisualFrontend, count_parameters
+from packed_dataset import PackedAVHubertDataset, load_meta, normalize_frames
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", required=True, help="Directory with input_*.lmdb, manifest.tsv and metadata.json")
-    parser.add_argument("--teacher-lmdb", required=True, help="Single LMDB containing AV-HuBERT [T,1024] targets")
-    parser.add_argument("--data-list", required=True, help="SEANet data_list.csv used to exclude val/test utterances")
+    parser.add_argument("--dataset-dir", required=True,
+                        help="Packed dataset written by prepare_dataset.py (meta.json, index.npz, shard_*.bin)")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--val-utterances", type=int, default=5000)
-    parser.add_argument("--max-train-utterances", type=int, default=None)
-    parser.add_argument("--embedding-dim", type=int, default=1024)
+    parser.add_argument("--embedding-dim", type=int, default=1024, help="Must equal the packed teacher dimension")
     parser.add_argument("--temporal-kernel", type=int, choices=[1, 3, 5], default=5)
     parser.add_argument("--stem-channels", type=int, default=16)
     parser.add_argument("--widths", default="24,32,64,96")
     parser.add_argument("--expand", type=float, default=2.0)
     parser.add_argument("--frames", type=int, default=50)
-    parser.add_argument("--pixel-mean", type=float, default=0.421)
-    parser.add_argument("--pixel-std", type=float, default=0.165)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min-lr", type=float, default=5e-6)
@@ -85,15 +80,11 @@ def _device_for(accelerator, xm=None):
     return torch.device("cpu")
 
 
-def _make_loader(samples, args, metadata, train, rank, world_size):
-    dataset = AVHubertLMDBDataset(
-        samples=samples,
-        input_dir=args.input_dir,
-        teacher_lmdb=args.teacher_lmdb,
-        compression=metadata.get("compression", "none"),
-        pixel_mean=args.pixel_mean,
-        pixel_std=args.pixel_std,
-        frames_per_sample=args.frames,
+def _make_loader(split, args, train, rank, world_size):
+    dataset = PackedAVHubertDataset(
+        args.dataset_dir,
+        split,
+        frames=args.frames,
         random_crop=train,
     )
     sampler = None
@@ -112,7 +103,7 @@ def _make_loader(samples, args, metadata, train, rank, world_size):
         shuffle=train and sampler is None,
         sampler=sampler,
         num_workers=args.workers,
-        pin_memory=(not train and torch.cuda.is_available()) or torch.cuda.is_available(),
+        pin_memory=torch.cuda.is_available(),
         drop_last=train,
         persistent_workers=args.workers > 0,
         prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
@@ -132,10 +123,13 @@ def _run_epoch(loader, sampler, student, optimizer, scaler, device, args,
     }
     num_samples = 0
     label = "train" if train else "val"
+    pixel_mean = loader.dataset.meta["pixel_mean"]
+    pixel_std = loader.dataset.meta["pixel_std"]
 
-    for frames, target, _keys in tqdm(loader, desc=label, dynamic_ncols=True,
-                                      disable=xm is not None and not xm.is_master_ordinal()):
-        frames = frames.to(device, non_blocking=True)
+    for frames, target in tqdm(loader, desc=label, dynamic_ncols=True,
+                               disable=xm is not None and not xm.is_master_ordinal()):
+        # uint8 [B,T,H,W] and float16 [B,T,D] cross the bus; normalize on the device.
+        frames = normalize_frames(frames.to(device, non_blocking=True), pixel_mean, pixel_std)
         target = target.to(device, non_blocking=True).permute(1, 0, 2).float()
         if target.shape[-1] != args.embedding_dim:
             raise ValueError(
@@ -233,7 +227,7 @@ def _save_checkpoint(path, student, optimizer, scheduler, scaler, epoch, best_va
         xm.save(checkpoint, path)
 
 
-def _train(args, accelerator, xm=None, prepared=None, rank=0, world_size=1, local_rank=0):
+def _train(args, accelerator, xm=None, rank=0, world_size=1, local_rank=0):
     if xm is not None:
         rank = xm.get_ordinal()
         world_size = xm.xrt_world_size()
@@ -245,22 +239,14 @@ def _train(args, accelerator, xm=None, prepared=None, rank=0, world_size=1, loca
         torch.cuda.set_device(local_rank)
     device = _device_for(accelerator, xm)
 
-    if prepared is None:
-        prepared = build_avhubert_samples(
-            input_dir=args.input_dir,
-            teacher_lmdb=args.teacher_lmdb,
-            data_list=args.data_list,
-            val_utterances=args.val_utterances,
-            max_train_utterances=args.max_train_utterances,
-            seed=args.seed,
+    meta = load_meta(args.dataset_dir)
+    if meta["teacher_dim"] != args.embedding_dim:
+        raise ValueError(
+            f"Packed teacher dimension is {meta['teacher_dim']}, but --embedding-dim={args.embedding_dim}."
         )
-    train_samples, val_samples, metadata = prepared
-    train_loader, train_sampler = _make_loader(
-        train_samples, args, metadata, True, rank, world_size
-    )
-    val_loader, val_sampler = _make_loader(
-        val_samples, args, metadata, False, rank, world_size
-    )
+    train_loader, train_sampler = _make_loader("train", args, True, rank, world_size)
+    val_loader, val_sampler = _make_loader("val", args, False, rank, world_size)
+    train_samples, val_samples = train_loader.dataset, val_loader.dataset
 
     widths = tuple(int(value) for value in args.widths.split(","))
     student = TinyVisualFrontend(
@@ -422,8 +408,8 @@ def _train(args, accelerator, xm=None, prepared=None, rank=0, world_size=1, loca
 
 def main():
     args = parse_args()
-    if args.embedding_dim <= 0 or args.frames <= 0 or args.pixel_std <= 0:
-        raise ValueError("Embedding dimension, frame count, and pixel std must be positive")
+    if args.embedding_dim <= 0 or args.frames <= 0:
+        raise ValueError("Embedding dimension and frame count must be positive")
     if args.gpus < 1 or args.workers < 0 or args.prefetch_factor < 1:
         raise ValueError("--gpus must be >= 1, --workers >= 0, and --prefetch-factor >= 1")
     accelerator = args.accelerator
@@ -439,14 +425,6 @@ def main():
                 f"Requested --gpus {args.gpus}, but only {available_gpus} CUDA GPUs are available."
             )
         if args.gpus > 1:
-            prepared = build_avhubert_samples(
-                input_dir=args.input_dir,
-                teacher_lmdb=args.teacher_lmdb,
-                data_list=args.data_list,
-                val_utterances=args.val_utterances,
-                max_train_utterances=args.max_train_utterances,
-                seed=args.seed,
-            )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
@@ -454,7 +432,7 @@ def main():
             os.environ["MASTER_PORT"] = str(port)
             mp.spawn(
                 _cuda_worker,
-                args=(args, prepared),
+                args=(args,),
                 nprocs=args.gpus,
                 join=True,
             )
@@ -467,17 +445,9 @@ def main():
             raise RuntimeError(
                 "--accelerator tpu requires a Kaggle TPU runtime with PyTorch/XLA installed"
             ) from exc
-        prepared = build_avhubert_samples(
-            input_dir=args.input_dir,
-            teacher_lmdb=args.teacher_lmdb,
-            data_list=args.data_list,
-            val_utterances=args.val_utterances,
-            max_train_utterances=args.max_train_utterances,
-            seed=args.seed,
-        )
         xmp.spawn(
             _xla_worker,
-            args=(args, prepared),
+            args=(args,),
             nprocs=args.tpu_cores,
             start_method="fork",
         )
@@ -487,7 +457,7 @@ def main():
         _train(args, accelerator)
 
 
-def _cuda_worker(local_rank, args, prepared):
+def _cuda_worker(local_rank, args):
     dist.init_process_group(
         backend="nccl",
         rank=local_rank,
@@ -497,7 +467,6 @@ def _cuda_worker(local_rank, args, prepared):
         _train(
             args,
             "cuda",
-            prepared=prepared,
             rank=local_rank,
             world_size=args.gpus,
             local_rank=local_rank,
@@ -506,10 +475,10 @@ def _cuda_worker(local_rank, args, prepared):
         dist.destroy_process_group()
 
 
-def _xla_worker(index, args, prepared):
+def _xla_worker(index, args):
     import torch_xla.core.xla_model as xm
 
-    _train(args, "tpu", xm, prepared)
+    _train(args, "tpu", xm)
 
 
 if __name__ == "__main__":

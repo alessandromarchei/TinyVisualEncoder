@@ -70,45 +70,86 @@ mixing raw 512-D teacher coordinates and PCA coordinates.
 
 ## AV-HuBERT Teacher
 
-`scripts/generate_mouths.py` creates input shards and a `manifest.tsv`. The
-AV-HuBERT distillation loader joins those inputs to a single teacher LMDB by
-utterance ID. Teacher values can be NumPy `.npy` byte streams or tensors saved
-with `torch.save`; the loader accepts absolute AV-HuBERT `.npz` source paths as
-keys. AV-HuBERT Large targets use 1024 dimensions by default.
+Training reads a packed dataset that is built once from the mouth-ROI input
+LMDB shards and the AV-HuBERT teacher LMDB. Each utterance is one contiguous
+record: uint8 mouth frames and float16 teacher embeddings, interleaved per
+frame, so a 50-frame training window is a single byte range. See
+[packed_dataset.py](packed_dataset.py) for the exact layout.
+
+### 1. Convert once
 
 ```bash
-python train_kd_avhubert.py \
+python prepare_dataset.py \
   --input-dir /kaggle/input/mouth-input-lmdb \
   --teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
   --data-list configs/data_list.csv \
-  --output runs/avhubert_kd \
-  --accelerator cuda \
-  --gpus 2 \
-  --workers 6 \
-  --compile
+  --output-dir /kaggle/working/avhubert_packed \
+  --teacher-dim 1024 \
+  --compare-legacy 64
+
+python prepare_dataset.py --check --output-dir /kaggle/working/avhubert_packed
 ```
 
-CUDA uses DistributedDataParallel when `--gpus` is greater than one. Batch
-size and worker count are per GPU, so `--batch-size 32 --gpus 2` gives an
-effective batch size of 64 and starts 12 data workers with `--workers 6`.
-`torch.compile` can improve model throughput but adds a one-time compile delay
-at the start of each run; it does not speed up LMDB reads or preprocessing.
+The conversion reuses the legacy split (`--val-utterances`, `--seed`) and the
+SEANet val/test exclusion. `--compare-legacy N` checks N random samples against
+the legacy loader: frames must match exactly, and the report includes the
+float16 teacher error and the KD-loss change for a fixed student. Skipped
+utterances are listed in `errors.tsv`. The packed format is uncompressed, so
+its size can be larger than the zlib-compressed input; check the output
+location's free space before starting.
 
-On a Kaggle TPU v5e-8 runtime with a compatible PyTorch/XLA installation, use:
+### 2. Train
 
 ```bash
 python train_kd_avhubert.py \
-  --input-dir /kaggle/input/mouth-input-lmdb \
-  --teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
-  --data-list configs/data_list.csv \
+  --dataset-dir /kaggle/working/avhubert_packed \
+  --output runs/avhubert_kd \
+  --accelerator cuda \
+  --batch-size 64 \
+  --workers 4 \
+  --prefetch-factor 2
+```
+
+Pixel mean/std and the teacher dimension come from the packed `meta.json`, so
+training cannot drift from how the data was packed. Normalization happens on the
+GPU. `--gpus N` uses DistributedDataParallel; batch size and workers are per GPU.
+
+On a Kaggle TPU v5e-8 runtime with a compatible PyTorch/XLA installation:
+
+```bash
+python train_kd_avhubert.py \
+  --dataset-dir /kaggle/working/avhubert_packed \
   --output runs/avhubert_kd_tpu \
   --accelerator tpu \
   --tpu-cores 8
 ```
 
-The TPU batch size is per core, so eight cores use an effective batch size of
-`8 * --batch-size`. Input pixels are normalized with AV-HuBERT's default
-`0.421` mean and `0.165` standard deviation; override these only if the
-teacher checkpoint used different values. Training logs loss, Huber, MSE, and
-cosine similarity to stdout, `history.json`, and W&B (unless `--no-wandb` is
-set), and saves `last.pt` and `best.pt` checkpoints.
+### 3. Benchmark the input pipeline
+
+```bash
+# Packed dataset, random order, with GPU step timing
+python benchmark_dataloader.py --dataset-dir /kaggle/working/avhubert_packed \
+  --batch-size 64 --workers 4 --batches 200 --train-steps --cache-state cold
+
+# Original pipeline on the same machine, for comparison
+python benchmark_dataloader.py --legacy-input-dir /kaggle/input/mouth-input-lmdb \
+  --legacy-teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
+  --legacy-data-list configs/data_list.csv \
+  --batch-size 64 --workers 4 --batches 200 --train-steps --cache-state cold
+```
+
+Run each benchmark once with a cold page cache (`--drop-caches` if passwordless
+sudo is available) and once warm. Peak USS, not RSS, reflects Python memory,
+because RSS also counts memory-mapped file pages.
+
+### Tests
+
+```bash
+python -m pytest -q test_packed_dataset.py
+```
+
+The tests build a small legacy fixture from synthetic data, convert it, and check
+the packed reader against the legacy loader. They need no Kaggle data.
+
+Training logs loss, Huber, MSE, and cosine similarity to stdout, `history.json`,
+and W&B (unless `--no-wandb` is set), and saves `last.pt` and `best.pt` checkpoints.

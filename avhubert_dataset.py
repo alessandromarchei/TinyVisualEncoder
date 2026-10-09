@@ -43,13 +43,13 @@ def canonical_key(key):
     return normalized.lstrip("/")
 
 
-def _decode_input(payload, compression):
+def decode_input(payload, compression):
     if compression == "zlib":
         payload = zlib.decompress(payload)
     return np.load(io.BytesIO(payload), allow_pickle=False)
 
 
-def _decode_target(payload):
+def decode_target(payload):
     try:
         target = np.load(io.BytesIO(payload), allow_pickle=False)
     except (ValueError, OSError):
@@ -347,8 +347,8 @@ class AVHubertLMDBDataset(Dataset):
         if target_payload is None:
             raise KeyError(f"Teacher LMDB key missing: {sample['target_key']}")
 
-        frames = _decode_input(input_payload, self.compression)
-        target = _decode_target(target_payload)
+        frames = decode_input(input_payload, self.compression)
+        target = decode_target(target_payload)
         if frames.ndim != 3:
             raise ValueError(f"Expected input [T,H,W], got {frames.shape}: {sample['key']}")
         if target.ndim != 2:
