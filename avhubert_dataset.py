@@ -71,11 +71,24 @@ def _resolve_lmdb_path(path):
         if nested.is_file() or (nested / "data.mdb").is_file():
             path = nested
         else:
-            raise FileNotFoundError(
-                f"{path} is a directory, but it is not an LMDB environment "
-                "(missing data.mdb). Pass the LMDB directory or the path to "
-                "data.lmdb inside the Kaggle dataset."
+            candidates = sorted(
+                child for child in path.iterdir()
+                if child.is_dir() and (child / "data.mdb").is_file()
             )
+            if len(candidates) == 1:
+                path = candidates[0]
+            elif candidates:
+                choices = ", ".join(str(candidate) for candidate in candidates)
+                raise ValueError(
+                    f"Multiple LMDB directories found under {path}: {choices}. "
+                    "Pass the intended directory with --teacher-lmdb."
+                )
+            else:
+                raise FileNotFoundError(
+                    f"{path} is a directory, but it is not an LMDB environment "
+                    "(missing data.mdb). Pass the LMDB directory, its parent "
+                    "containing one LMDB child, or data.lmdb inside the dataset."
+                )
     return path
 
 
@@ -92,35 +105,43 @@ def _open_lmdb(path):
     )
 
 
-def _teacher_key_index(path, wanted_keys):
-    wanted_keys = set(wanted_keys)
+def _candidate_teacher_keys(row, dataset_roots):
+    normalized = canonical_key(row["key"])
+    dataset = row.get("dataset", "")
+    source_relative = row.get("source_relative", "")
+    candidates = [row["key"], normalized, f"{normalized}.npz"]
+
+    root = dataset_roots.get(dataset)
+    if root and source_relative:
+        candidates.insert(
+            0,
+            str((Path(root).expanduser() / source_relative).resolve()),
+        )
+    return list(dict.fromkeys(candidates))
+
+
+def _teacher_key_index(path, manifest_rows, dataset_roots):
     path = _resolve_lmdb_path(path)
     print(f"Opening teacher LMDB: {path}", flush=True)
     env = _open_lmdb(path)
     index = {}
-    total_keys = env.stat()["entries"]
-    print(f"Scanning {total_keys:,} teacher keys for input utterances...", flush=True)
+    print(
+        f"Looking up teacher targets for {len(manifest_rows):,} input rows...",
+        flush=True,
+    )
     try:
         with env.begin(write=False) as txn:
-            cursor = txn.cursor()
-            for raw_key in tqdm(
-                cursor.iternext(keys=True, values=False),
-                total=total_keys,
-                desc="Indexing AV-HuBERT LMDB",
-                unit="keys",
+            for row in tqdm(
+                manifest_rows,
+                desc="Matching AV-HuBERT targets",
+                unit="rows",
                 dynamic_ncols=True,
             ):
-                key = raw_key.decode("utf-8")
-                normalized = canonical_key(key)
-                if normalized not in wanted_keys:
-                    continue
-                previous = index.get(normalized)
-                if previous is not None and previous != key:
-                    raise ValueError(
-                        "Ambiguous AV-HuBERT LMDB keys normalize to "
-                        f"{normalized!r}: {previous!r} and {key!r}"
-                    )
-                index[normalized] = key
+                normalized = canonical_key(row["key"])
+                for key in _candidate_teacher_keys(row, dataset_roots):
+                    if txn.get(key.encode("utf-8")) is not None:
+                        index[normalized] = key
+                        break
     finally:
         env.close()
     print(f"Matched {len(index):,} teacher keys to input manifest.", flush=True)
@@ -173,8 +194,11 @@ def build_avhubert_samples(
         "matching AV-HuBERT targets...",
         flush=True,
     )
-    wanted_keys = {canonical_key(row["key"]) for row in manifest_rows}
-    teacher_index = _teacher_key_index(teacher_lmdb, wanted_keys)
+    teacher_index = _teacher_key_index(
+        teacher_lmdb,
+        manifest_rows,
+        metadata.get("dataset_roots", {}),
+    )
     samples = []
     missing_targets = 0
 
