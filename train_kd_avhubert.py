@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Distill TinyVisualFrontend from precomputed AV-HuBERT embeddings."""
+
+import argparse
+import json
+import random
+from contextlib import nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
+
+from avhubert_dataset import AVHubertLMDBDataset, build_avhubert_samples
+from losses import kd_loss
+from models.tiny_visual_frontend import TinyVisualFrontend, count_parameters
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-dir", required=True, help="Directory with input_*.lmdb, manifest.tsv and metadata.json")
+    parser.add_argument("--teacher-lmdb", required=True, help="Single LMDB containing AV-HuBERT [T,1024] targets")
+    parser.add_argument("--data-list", required=True, help="SEANet data_list.csv used to exclude val/test utterances")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--val-utterances", type=int, default=5000)
+    parser.add_argument("--max-train-utterances", type=int, default=None)
+    parser.add_argument("--embedding-dim", type=int, default=1024)
+    parser.add_argument("--temporal-kernel", type=int, choices=[1, 3, 5], default=5)
+    parser.add_argument("--stem-channels", type=int, default=16)
+    parser.add_argument("--widths", default="24,32,64,96")
+    parser.add_argument("--expand", type=float, default=2.0)
+    parser.add_argument("--frames", type=int, default=50)
+    parser.add_argument("--pixel-mean", type=float, default=0.421)
+    parser.add_argument("--pixel-std", type=float, default=0.165)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--min-lr", type=float, default=5e-6)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--huber-weight", type=float, default=1.0)
+    parser.add_argument("--cosine-weight", type=float, default=0.5)
+    parser.add_argument("--teacher-stats", default=None, help="Optional NPZ with mean[D] and std[D]")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--accelerator", choices=["auto", "cuda", "cpu", "tpu"], default="auto")
+    parser.add_argument("--tpu-cores", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb-project", default="lip-embedding-frontend")
+    parser.add_argument("--wandb-name", default=None)
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--no-wandb", action="store_true")
+    return parser.parse_args()
+
+
+def set_seed(seed, rank=0):
+    seed += rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _device_for(accelerator, xm=None):
+    if accelerator == "tpu":
+        return xm.xla_device()
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was selected, but CUDA is not available.")
+        return torch.device("cuda")
+    if accelerator == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
+
+
+def _make_loader(samples, args, metadata, train, rank, world_size):
+    dataset = AVHubertLMDBDataset(
+        samples=samples,
+        input_dir=args.input_dir,
+        teacher_lmdb=args.teacher_lmdb,
+        compression=metadata.get("compression", "none"),
+        pixel_mean=args.pixel_mean,
+        pixel_std=args.pixel_std,
+        frames_per_sample=args.frames,
+        random_crop=train,
+    )
+    sampler = None
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=train,
+            seed=args.seed,
+            drop_last=train,
+        )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=train and sampler is None,
+        sampler=sampler,
+        num_workers=args.workers,
+        pin_memory=(not train and torch.cuda.is_available()) or torch.cuda.is_available(),
+        drop_last=train,
+        persistent_workers=args.workers > 0,
+        prefetch_factor=2 if args.workers > 0 else None,
+    )
+    return loader, sampler
+
+
+def _run_epoch(loader, sampler, student, optimizer, scaler, device, args,
+               feature_mean, feature_std, train, epoch, accelerator, xm=None):
+    if sampler is not None and train:
+        sampler.set_epoch(epoch)
+    student.train(train)
+    totals = {"loss": 0.0, "huber": 0.0, "mse": 0.0, "cosine_similarity": 0.0}
+    num_samples = 0
+    label = "train" if train else "val"
+
+    for frames, target, _keys in tqdm(loader, desc=label, dynamic_ncols=True,
+                                      disable=xm is not None and not xm.is_master_ordinal()):
+        frames = frames.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True).permute(1, 0, 2).float()
+        if target.shape[-1] != args.embedding_dim:
+            raise ValueError(
+                f"Teacher dimension is {target.shape[-1]}, but --embedding-dim="
+                f"{args.embedding_dim}. Set --embedding-dim to the LMDB feature size."
+            )
+        model_input = frames.permute(1, 0, 2, 3).unsqueeze(2)
+
+        if accelerator == "cuda" and args.amp:
+            autocast = torch.autocast("cuda", dtype=torch.float16)
+        elif accelerator == "tpu" and args.amp:
+            autocast = torch.autocast("xla", dtype=torch.bfloat16)
+        else:
+            autocast = nullcontext()
+
+        with torch.set_grad_enabled(train):
+            with autocast:
+                prediction = student(model_input)
+            loss, metrics = kd_loss(
+                prediction.float(),
+                target.float(),
+                args.huber_weight,
+                args.cosine_weight,
+                feature_mean,
+                feature_std,
+            )
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip)
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                elif xm is not None:
+                    xm.optimizer_step(optimizer)
+                else:
+                    optimizer.step()
+
+        batch_size = frames.shape[0]
+        num_samples += batch_size
+        totals["loss"] += loss.detach().item() * batch_size
+        for key, value in metrics.items():
+            totals[key] += value.item() * batch_size
+
+    values = [totals[key] for key in ("loss", "huber", "mse", "cosine_similarity")]
+    values.append(num_samples)
+    if xm is not None and xm.xrt_world_size() > 1:
+        values = xm.mesh_reduce(
+            f"{label}_metrics",
+            values,
+            lambda results: [sum(result[index] for result in results) for index in range(len(values))],
+        )
+    count = max(values[-1], 1)
+    return {
+        key: values[index] / count
+        for index, key in enumerate(("loss", "huber", "mse", "cosine_similarity"))
+    }
+
+
+def _save_checkpoint(path, student, optimizer, scheduler, scaler, epoch, best_val, args, xm):
+    checkpoint = {
+        "epoch": epoch,
+        "model": student.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else {},
+        "best_val": best_val,
+        "args": vars(args),
+    }
+    if xm is None:
+        torch.save(checkpoint, path)
+    else:
+        xm.save(checkpoint, path)
+
+
+def _train(args, accelerator, xm=None, prepared=None):
+    rank = xm.get_ordinal() if xm is not None else 0
+    world_size = xm.xrt_world_size() if xm is not None else 1
+    is_master = xm.is_master_ordinal() if xm is not None else True
+    set_seed(args.seed, rank)
+    device = _device_for(accelerator, xm)
+
+    if prepared is None:
+        prepared = build_avhubert_samples(
+            input_dir=args.input_dir,
+            teacher_lmdb=args.teacher_lmdb,
+            data_list=args.data_list,
+            val_utterances=args.val_utterances,
+            max_train_utterances=args.max_train_utterances,
+            seed=args.seed,
+        )
+    train_samples, val_samples, metadata = prepared
+    train_loader, train_sampler = _make_loader(
+        train_samples, args, metadata, True, rank, world_size
+    )
+    val_loader, val_sampler = _make_loader(
+        val_samples, args, metadata, False, rank, world_size
+    )
+
+    widths = tuple(int(value) for value in args.widths.split(","))
+    student = TinyVisualFrontend(
+        embedding_dim=args.embedding_dim,
+        temporal_kernel=args.temporal_kernel,
+        stem_channels=args.stem_channels,
+        widths=widths,
+        expand=args.expand,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        student.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.min_lr
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=args.amp and accelerator == "cuda"
+    ) if accelerator == "cuda" else None
+
+    feature_mean = feature_std = None
+    if args.teacher_stats:
+        stats = np.load(args.teacher_stats)
+        feature_mean = torch.as_tensor(stats["mean"], device=device, dtype=torch.float32)
+        feature_std = torch.as_tensor(stats["std"], device=device, dtype=torch.float32)
+        expected = (args.embedding_dim,)
+        if feature_mean.shape != expected or feature_std.shape != expected:
+            raise ValueError(f"Teacher statistics must have shape {expected}")
+
+    output_dir = Path(args.output)
+    checkpoint_dir = output_dir / "checkpoints"
+    if is_master:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "config.json").write_text(json.dumps(vars(args), indent=2) + "\n")
+        print("\nAV-HuBERT visual knowledge distillation")
+        print("=" * 72)
+        print(f"Accelerator         : {accelerator}")
+        print(f"Device              : {device}")
+        print(f"TPU processes       : {world_size if xm is not None else 0}")
+        print(f"Train/val samples   : {len(train_samples):,} / {len(val_samples):,}")
+        print(f"Train/val batches   : {len(train_loader):,} / {len(val_loader):,}")
+        print(f"Teacher dimension   : {args.embedding_dim}")
+        print(f"Student parameters  : {count_parameters(student):,}")
+        print("=" * 72)
+    if xm is not None:
+        xm.rendezvous("avhubert-output-ready")
+
+    start_epoch = 1
+    best_val = float("inf")
+    history_path = output_dir / "history.json"
+    history = []
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        student.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if scaler is not None and checkpoint.get("scaler"):
+            scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val = checkpoint.get("best_val", best_val)
+        if is_master and history_path.is_file():
+            history = json.loads(history_path.read_text())
+
+    wandb_run = None
+    if is_master and not args.no_wandb:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name or output_dir.name,
+            config={
+                **vars(args),
+                "num_train_samples": len(train_samples),
+                "num_val_samples": len(val_samples),
+                "student_parameters": count_parameters(student),
+                "accelerator": accelerator,
+                "world_size": world_size,
+            },
+            dir=str(output_dir),
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("val/*", step_metric="epoch")
+        wandb.define_metric("lr", step_metric="epoch")
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_metrics = _run_epoch(
+            train_loader, train_sampler, student, optimizer, scaler, device,
+            args, feature_mean, feature_std, True, epoch, accelerator, xm,
+        )
+        val_metrics = _run_epoch(
+            val_loader, val_sampler, student, optimizer, scaler, device,
+            args, feature_mean, feature_std, False, epoch, accelerator, xm,
+        )
+        current_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step()
+
+        if is_master:
+            row = {"epoch": epoch, "lr": current_lr, "train": train_metrics, "val": val_metrics}
+            history.append(row)
+            history_path.write_text(json.dumps(history, indent=2) + "\n")
+            print(f"\nEpoch {epoch:03d}/{args.epochs:03d} | lr={current_lr:.8g}")
+            for label, metrics in (("Train", train_metrics), ("Val", val_metrics)):
+                print(
+                    f"{label} | loss={metrics['loss']:.6f} "
+                    f"huber={metrics['huber']:.6f} mse={metrics['mse']:.6f} "
+                    f"cos={metrics['cosine_similarity']:.5f}"
+                )
+            if wandb_run is not None:
+                import wandb
+
+                wandb.log({
+                    "epoch": epoch,
+                    **{f"train/{key}": value for key, value in train_metrics.items()},
+                    **{f"val/{key}": value for key, value in val_metrics.items()},
+                    "lr": current_lr,
+                }, step=epoch)
+
+            _save_checkpoint(
+                checkpoint_dir / "last.pt", student, optimizer, scheduler,
+                scaler, epoch, best_val, args, xm,
+            )
+            if val_metrics["loss"] < best_val:
+                best_val = val_metrics["loss"]
+                _save_checkpoint(
+                    checkpoint_dir / "best.pt", student, optimizer, scheduler,
+                    scaler, epoch, best_val, args, xm,
+                )
+                print(f"New best validation loss: {best_val:.6f}")
+        if xm is not None:
+            xm.rendezvous(f"avhubert-epoch-{epoch}-saved")
+
+    if is_master:
+        print(f"\nTraining complete. Best validation loss: {best_val:.6f}")
+        print(f"Best checkpoint: {checkpoint_dir / 'best.pt'}")
+        if wandb_run is not None:
+            import wandb
+
+            wandb.finish()
+
+
+def main():
+    args = parse_args()
+    if args.embedding_dim <= 0 or args.frames <= 0 or args.pixel_std <= 0:
+        raise ValueError("Embedding dimension, frame count, and pixel std must be positive")
+    accelerator = args.accelerator
+    if accelerator == "auto":
+        accelerator = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if accelerator == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            import torch_xla.distributed.xla_multiprocessing as xmp
+        except ImportError as exc:
+            raise RuntimeError(
+                "--accelerator tpu requires a Kaggle TPU runtime with PyTorch/XLA installed"
+            ) from exc
+        prepared = build_avhubert_samples(
+            input_dir=args.input_dir,
+            teacher_lmdb=args.teacher_lmdb,
+            data_list=args.data_list,
+            val_utterances=args.val_utterances,
+            max_train_utterances=args.max_train_utterances,
+            seed=args.seed,
+        )
+        xmp.spawn(
+            _xla_worker,
+            args=(args, prepared),
+            nprocs=args.tpu_cores,
+            start_method="fork",
+        )
+    else:
+        _train(args, accelerator)
+
+
+def _xla_worker(index, args, prepared):
+    import torch_xla.core.xla_model as xm
+
+    _train(args, "tpu", xm, prepared)
+
+
+if __name__ == "__main__":
+    main()

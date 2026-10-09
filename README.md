@@ -67,3 +67,39 @@ components, transform each teacher target as:
 and instantiate the student with `embedding_dim=128`. No projection head is
 needed. This should be a separate trainer/target mode to avoid accidentally
 mixing raw 512-D teacher coordinates and PCA coordinates.
+
+## AV-HuBERT Teacher
+
+`scripts/generate_mouths.py` creates input shards and a `manifest.tsv`. The
+AV-HuBERT distillation loader joins those inputs to a single teacher LMDB by
+utterance ID. Teacher values can be NumPy `.npy` byte streams or tensors saved
+with `torch.save`; the loader accepts absolute AV-HuBERT `.npz` source paths as
+keys. AV-HuBERT Large targets use 1024 dimensions by default.
+
+```bash
+python train_kd_avhubert.py \
+  --input-dir /kaggle/input/mouth-input-lmdb \
+  --teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
+  --data-list configs/data_list.csv \
+  --output runs/avhubert_kd \
+  --accelerator cuda
+```
+
+On a Kaggle TPU v5e-8 runtime with a compatible PyTorch/XLA installation, use:
+
+```bash
+python train_kd_avhubert.py \
+  --input-dir /kaggle/input/mouth-input-lmdb \
+  --teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
+  --data-list configs/data_list.csv \
+  --output runs/avhubert_kd_tpu \
+  --accelerator tpu \
+  --tpu-cores 8
+```
+
+The TPU batch size is per core, so eight cores use an effective batch size of
+`8 * --batch-size`. Input pixels are normalized with AV-HuBERT's default
+`0.421` mean and `0.165` standard deviation; override these only if the
+teacher checkpoint used different values. Training logs loss, Huber, MSE, and
+cosine similarity to stdout, `history.json`, and W&B (unless `--no-wandb` is
+set), and saves `last.pt` and `best.pt` checkpoints.

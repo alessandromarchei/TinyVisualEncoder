@@ -17,7 +17,7 @@ from models.tiny_visual_frontend import (
     TinyVisualFrontend,
     count_parameters,
 )
-from models.visual_frontend import VisualFrontend
+from models.visual_frontend_resnet18 import VisualFrontend
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
