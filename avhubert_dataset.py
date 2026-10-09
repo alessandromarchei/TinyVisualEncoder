@@ -12,6 +12,7 @@ import lmdb
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 _DATASET_NAMES = {"lrs2", "lrs3", "voxceleb2"}
@@ -61,10 +62,25 @@ def _decode_target(payload):
     return np.asarray(target)
 
 
-def _open_lmdb(path):
+def _resolve_lmdb_path(path):
     path = Path(path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"LMDB not found: {path}")
+    if path.is_dir() and not (path / "data.mdb").is_file():
+        nested = path / "data.lmdb"
+        if nested.is_file() or (nested / "data.mdb").is_file():
+            path = nested
+        else:
+            raise FileNotFoundError(
+                f"{path} is a directory, but it is not an LMDB environment "
+                "(missing data.mdb). Pass the LMDB directory or the path to "
+                "data.lmdb inside the Kaggle dataset."
+            )
+    return path
+
+
+def _open_lmdb(path):
+    path = _resolve_lmdb_path(path)
     return lmdb.open(
         str(path),
         subdir=path.is_dir(),
@@ -78,12 +94,22 @@ def _open_lmdb(path):
 
 def _teacher_key_index(path, wanted_keys):
     wanted_keys = set(wanted_keys)
+    path = _resolve_lmdb_path(path)
+    print(f"Opening teacher LMDB: {path}", flush=True)
     env = _open_lmdb(path)
     index = {}
+    total_keys = env.stat()["entries"]
+    print(f"Scanning {total_keys:,} teacher keys for input utterances...", flush=True)
     try:
         with env.begin(write=False) as txn:
             cursor = txn.cursor()
-            for raw_key in cursor.iternext(keys=True, values=False):
+            for raw_key in tqdm(
+                cursor.iternext(keys=True, values=False),
+                total=total_keys,
+                desc="Indexing AV-HuBERT LMDB",
+                unit="keys",
+                dynamic_ncols=True,
+            ):
                 key = raw_key.decode("utf-8")
                 normalized = canonical_key(key)
                 if normalized not in wanted_keys:
@@ -97,6 +123,7 @@ def _teacher_key_index(path, wanted_keys):
                 index[normalized] = key
     finally:
         env.close()
+    print(f"Matched {len(index):,} teacher keys to input manifest.", flush=True)
     return index
 
 
@@ -141,6 +168,11 @@ def build_avhubert_samples(
             raise ValueError("Input manifest must contain key and shard columns")
         manifest_rows = list(rows)
 
+    print(
+        f"Loaded {len(manifest_rows):,} input manifest rows; "
+        "matching AV-HuBERT targets...",
+        flush=True,
+    )
     wanted_keys = {canonical_key(row["key"]) for row in manifest_rows}
     teacher_index = _teacher_key_index(teacher_lmdb, wanted_keys)
     samples = []
