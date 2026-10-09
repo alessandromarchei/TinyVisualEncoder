@@ -29,7 +29,10 @@ def canonical_key(key):
             break
 
     parts = [part for part in value.split("/") if part and part != "."]
-    if parts and (parts[0] in _DATASET_NAMES or parts[0] == "mouth"):
+    if parts and (
+        parts[0] in _DATASET_NAMES
+        or parts[0] in {"mouth", "embedding"}
+    ):
         parts = parts[1:]
 
     normalized = "/".join(parts)
@@ -111,14 +114,21 @@ def _candidate_teacher_keys(row, dataset_roots):
     normalized = canonical_key(row["key"])
     dataset = row.get("dataset", "")
     source_relative = row.get("source_relative", "")
-    candidates = [row["key"], normalized, f"{normalized}.npz"]
+    source_stem = Path(source_relative).stem if source_relative else ""
+    candidates = [
+        row["key"],
+        normalized,
+        f"{normalized}.npz",
+        f"embedding/{normalized}.npy",
+    ]
+    if source_stem:
+        candidates.extend((source_stem, f"embedding/{source_stem}.npy"))
 
     root = dataset_roots.get(dataset)
     if root and source_relative:
-        candidates.insert(
-            0,
-            str((Path(root).expanduser() / source_relative).resolve()),
-        )
+        source_path = (Path(root).expanduser() / source_relative).resolve()
+        candidates.insert(0, str(source_path))
+        candidates.append(f"embedding/{source_path.stem}.npy")
     return list(dict.fromkeys(candidates))
 
 
