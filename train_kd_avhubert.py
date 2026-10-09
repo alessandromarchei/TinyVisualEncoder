@@ -3,12 +3,17 @@
 
 import argparse
 import json
+import os
 import random
+import socket
 from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
@@ -35,6 +40,7 @@ def parse_args():
     parser.add_argument("--pixel-std", type=float, default=0.165)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min-lr", type=float, default=5e-6)
@@ -45,6 +51,9 @@ def parse_args():
     parser.add_argument("--teacher-stats", default=None, help="Optional NPZ with mean[D] and std[D]")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--accelerator", choices=["auto", "cuda", "cpu", "tpu"], default="auto")
+    parser.add_argument("--gpus", type=int, default=1, help="Number of CUDA GPUs for DDP; batch size and workers are per GPU")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False, help="Compile the student with torch.compile")
+    parser.add_argument("--compile-mode", choices=["default", "reduce-overhead", "max-autotune"], default="default")
     parser.add_argument("--tpu-cores", type=int, choices=range(1, 9), default=8)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -106,7 +115,7 @@ def _make_loader(samples, args, metadata, train, rank, world_size):
         pin_memory=(not train and torch.cuda.is_available()) or torch.cuda.is_available(),
         drop_last=train,
         persistent_workers=args.workers > 0,
-        prefetch_factor=2 if args.workers > 0 else None,
+        prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
     )
     return loader, sampler
 
@@ -116,7 +125,11 @@ def _run_epoch(loader, sampler, student, optimizer, scaler, device, args,
     if sampler is not None and train:
         sampler.set_epoch(epoch)
     student.train(train)
-    totals = {"loss": 0.0, "huber": 0.0, "mse": 0.0, "cosine_similarity": 0.0}
+    metric_names = ("loss", "huber", "mse", "cosine_similarity")
+    totals = {
+        name: torch.zeros((), device=device, dtype=torch.float64)
+        for name in metric_names
+    }
     num_samples = 0
     label = "train" if train else "val"
 
@@ -167,29 +180,47 @@ def _run_epoch(loader, sampler, student, optimizer, scaler, device, args,
 
         batch_size = frames.shape[0]
         num_samples += batch_size
-        totals["loss"] += loss.detach().item() * batch_size
+        totals["loss"] += loss.detach().to(torch.float64) * batch_size
         for key, value in metrics.items():
-            totals[key] += value.item() * batch_size
+            totals[key] += value.to(torch.float64) * batch_size
 
-    values = [totals[key] for key in ("loss", "huber", "mse", "cosine_similarity")]
-    values.append(num_samples)
+    sums = torch.stack([totals[key] for key in metric_names] + [
+        torch.tensor(num_samples, device=device, dtype=torch.float64)
+    ])
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
     if xm is not None and xm.xrt_world_size() > 1:
         values = xm.mesh_reduce(
             f"{label}_metrics",
-            values,
-            lambda results: [sum(result[index] for result in results) for index in range(len(values))],
+            sums.cpu().tolist(),
+            lambda results: [
+                sum(result[index] for result in results)
+                for index in range(len(results[0]))
+            ],
         )
+        sums = torch.tensor(values, dtype=torch.float64)
+    values = sums.cpu().tolist()
     count = max(values[-1], 1)
     return {
         key: values[index] / count
-        for index, key in enumerate(("loss", "huber", "mse", "cosine_similarity"))
+        for index, key in enumerate(metric_names)
     }
+
+
+def _unwrap_student(student):
+    while True:
+        if hasattr(student, "module"):
+            student = student.module
+        elif hasattr(student, "_orig_mod"):
+            student = student._orig_mod
+        else:
+            return student
 
 
 def _save_checkpoint(path, student, optimizer, scheduler, scaler, epoch, best_val, args, xm):
     checkpoint = {
         "epoch": epoch,
-        "model": student.state_dict(),
+        "model": _unwrap_student(student).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else {},
@@ -202,11 +233,16 @@ def _save_checkpoint(path, student, optimizer, scheduler, scaler, epoch, best_va
         xm.save(checkpoint, path)
 
 
-def _train(args, accelerator, xm=None, prepared=None):
-    rank = xm.get_ordinal() if xm is not None else 0
-    world_size = xm.xrt_world_size() if xm is not None else 1
-    is_master = xm.is_master_ordinal() if xm is not None else True
+def _train(args, accelerator, xm=None, prepared=None, rank=0, world_size=1, local_rank=0):
+    if xm is not None:
+        rank = xm.get_ordinal()
+        world_size = xm.xrt_world_size()
+        is_master = xm.is_master_ordinal()
+    else:
+        is_master = rank == 0
     set_seed(args.seed, rank)
+    if accelerator == "cuda":
+        torch.cuda.set_device(local_rank)
     device = _device_for(accelerator, xm)
 
     if prepared is None:
@@ -234,6 +270,18 @@ def _train(args, accelerator, xm=None, prepared=None):
         widths=widths,
         expand=args.expand,
     ).to(device)
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("--compile requires PyTorch 2.0 or newer")
+        if accelerator == "tpu":
+            raise ValueError("--compile is currently supported here for CUDA/CPU, not the XLA TPU path")
+        student = torch.compile(student, mode=args.compile_mode)
+    if world_size > 1 and accelerator == "cuda":
+        student = DistributedDataParallel(
+            student,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
     optimizer = torch.optim.AdamW(
         student.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -263,6 +311,10 @@ def _train(args, accelerator, xm=None, prepared=None):
         print(f"Accelerator         : {accelerator}")
         print(f"Device              : {device}")
         print(f"TPU processes       : {world_size if xm is not None else 0}")
+        print(f"CUDA GPUs           : {world_size if accelerator == 'cuda' else 0}")
+        print(f"Global batch size   : {args.batch_size * world_size}")
+        print(f"Workers per GPU     : {args.workers}")
+        print(f"torch.compile       : {args.compile}")
         print(f"Train/val samples   : {len(train_samples):,} / {len(val_samples):,}")
         print(f"Train/val batches   : {len(train_loader):,} / {len(val_loader):,}")
         print(f"Teacher dimension   : {args.embedding_dim}")
@@ -277,7 +329,7 @@ def _train(args, accelerator, xm=None, prepared=None):
     history = []
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
-        student.load_state_dict(checkpoint["model"], strict=True)
+        _unwrap_student(student).load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         if scaler is not None and checkpoint.get("scaler"):
@@ -356,6 +408,8 @@ def _train(args, accelerator, xm=None, prepared=None):
                 print(f"New best validation loss: {best_val:.6f}")
         if xm is not None:
             xm.rendezvous(f"avhubert-epoch-{epoch}-saved")
+        elif dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     if is_master:
         print(f"\nTraining complete. Best validation loss: {best_val:.6f}")
@@ -370,13 +424,44 @@ def main():
     args = parse_args()
     if args.embedding_dim <= 0 or args.frames <= 0 or args.pixel_std <= 0:
         raise ValueError("Embedding dimension, frame count, and pixel std must be positive")
+    if args.gpus < 1 or args.workers < 0 or args.prefetch_factor < 1:
+        raise ValueError("--gpus must be >= 1, --workers >= 0, and --prefetch-factor >= 1")
     accelerator = args.accelerator
     if accelerator == "auto":
         accelerator = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if accelerator == "tpu":
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was selected, but CUDA is not available.")
+        available_gpus = torch.cuda.device_count()
+        if args.gpus > available_gpus:
+            raise ValueError(
+                f"Requested --gpus {args.gpus}, but only {available_gpus} CUDA GPUs are available."
+            )
+        if args.gpus > 1:
+            prepared = build_avhubert_samples(
+                input_dir=args.input_dir,
+                teacher_lmdb=args.teacher_lmdb,
+                data_list=args.data_list,
+                val_utterances=args.val_utterances,
+                max_train_utterances=args.max_train_utterances,
+                seed=args.seed,
+            )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(port)
+            mp.spawn(
+                _cuda_worker,
+                args=(args, prepared),
+                nprocs=args.gpus,
+                join=True,
+            )
+        else:
+            _train(args, accelerator)
+    elif accelerator == "tpu":
         try:
-            import torch_xla.core.xla_model as xm
             import torch_xla.distributed.xla_multiprocessing as xmp
         except ImportError as exc:
             raise RuntimeError(
@@ -397,7 +482,28 @@ def main():
             start_method="fork",
         )
     else:
+        if args.gpus != 1:
+            raise ValueError("--gpus is only valid with --accelerator cuda")
         _train(args, accelerator)
+
+
+def _cuda_worker(local_rank, args, prepared):
+    dist.init_process_group(
+        backend="nccl",
+        rank=local_rank,
+        world_size=args.gpus,
+    )
+    try:
+        _train(
+            args,
+            "cuda",
+            prepared=prepared,
+            rank=local_rank,
+            world_size=args.gpus,
+            local_rank=local_rank,
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 def _xla_worker(index, args, prepared):

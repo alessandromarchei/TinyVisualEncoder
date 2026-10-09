@@ -82,8 +82,17 @@ python train_kd_avhubert.py \
   --teacher-lmdb /kaggle/input/avhubert-targets/data.lmdb \
   --data-list configs/data_list.csv \
   --output runs/avhubert_kd \
-  --accelerator cuda
+  --accelerator cuda \
+  --gpus 2 \
+  --workers 6 \
+  --compile
 ```
+
+CUDA uses DistributedDataParallel when `--gpus` is greater than one. Batch
+size and worker count are per GPU, so `--batch-size 32 --gpus 2` gives an
+effective batch size of 64 and starts 12 data workers with `--workers 6`.
+`torch.compile` can improve model throughput but adds a one-time compile delay
+at the start of each run; it does not speed up LMDB reads or preprocessing.
 
 On a Kaggle TPU v5e-8 runtime with a compatible PyTorch/XLA installation, use:
 
