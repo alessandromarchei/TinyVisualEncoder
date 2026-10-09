@@ -23,11 +23,13 @@ def canonical_key(key):
     value = key.decode("utf-8") if isinstance(key, bytes) else str(key)
     value = value.replace("\\", "/")
 
-    if "/mouths/" in value:
-        value = value.rsplit("/mouths/", 1)[1]
+    for marker in ("/mouths/", "/lrs2/", "/lrs3/", "/voxceleb2/"):
+        if marker in value:
+            value = value.rsplit(marker, 1)[1]
+            break
 
     parts = [part for part in value.split("/") if part and part != "."]
-    if parts and parts[0] in _DATASET_NAMES:
+    if parts and (parts[0] in _DATASET_NAMES or parts[0] == "mouth"):
         parts = parts[1:]
 
     normalized = "/".join(parts)
@@ -125,6 +127,7 @@ def _teacher_key_index(path, manifest_rows, dataset_roots):
     print(f"Opening teacher LMDB: {path}", flush=True)
     env = _open_lmdb(path)
     index = {}
+    sample_teacher_keys = []
     print(
         f"Looking up teacher targets for {len(manifest_rows):,} input rows...",
         flush=True,
@@ -142,9 +145,53 @@ def _teacher_key_index(path, manifest_rows, dataset_roots):
                     if txn.get(key.encode("utf-8")) is not None:
                         index[normalized] = key
                         break
+
+            missing = {
+                canonical_key(row["key"])
+                for row in manifest_rows
+                if canonical_key(row["key"]) not in index
+            }
+            if missing:
+                print(
+                    f"Direct key lookups matched {len(index):,}; scanning "
+                    "LMDB keys for path-independent matches...",
+                    flush=True,
+                )
+                total_keys = env.stat()["entries"]
+                cursor = txn.cursor()
+                for raw_key in tqdm(
+                    cursor.iternext(keys=True, values=False),
+                    total=total_keys,
+                    desc="Normalizing teacher keys",
+                    unit="keys",
+                    dynamic_ncols=True,
+                ):
+                    try:
+                        key = raw_key.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    if len(sample_teacher_keys) < 8:
+                        sample_teacher_keys.append(key)
+                    normalized = canonical_key(key)
+                    if normalized in missing:
+                        index[normalized] = key
+                        missing.remove(normalized)
+                        if not missing:
+                            break
     finally:
         env.close()
     print(f"Matched {len(index):,} teacher keys to input manifest.", flush=True)
+    if not index:
+        print("Sample input/teacher keys for diagnosis:", flush=True)
+        for row in manifest_rows[:3]:
+            print(f"  input: {row['key']}", flush=True)
+            print(
+                "  candidates: "
+                + ", ".join(_candidate_teacher_keys(row, dataset_roots)),
+                flush=True,
+            )
+        for key in sample_teacher_keys:
+            print(f"  teacher: {key}", flush=True)
     return index
 
 
